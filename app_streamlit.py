@@ -11,17 +11,16 @@ import os
 st.set_page_config(page_title="Estudiante AI - RAG", layout="wide", page_icon="📚")
 
 st.title("🤖 Tu Asistente de Algoritmos (RAG)")
-st.markdown("Sube tus apuntes y pregunta lo que necesites. ¡Ideal para preparar finales!")
+st.markdown("Sube tus apuntes y consulta con inteligencia contextual.")
 
 # --- SIDEBAR: CONFIGURACIÓN Y CARGA ---
 with st.sidebar:
     st.header("1. Configuración")
     
-    # Intentamos obtener la Key de los Secrets de Streamlit
-    # Si no existe en Secrets, permitimos ponerla a mano
+    # Prioridad: 1. Secrets de Streamlit, 2. Entrada manual
     groq_key = st.secrets.get("GROQ_API_KEY", "")
     if not groq_key:
-        groq_key = st.text_input("Groq API Key no detectada. Ingrésala aquí:", type="password")
+        groq_key = st.text_input("Ingresa tu Groq API Key:", type="password")
     else:
         st.success("API Key cargada desde Secrets ✅")
 
@@ -38,31 +37,25 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 
 # --- FUNCIÓN DE PROCESAMIENTO DE PDFS ---
-# Usamos @st.cache_resource para que no procese los archivos cada vez que preguntamos
 @st.cache_resource
 def crear_base_conocimiento(files):
     if not files:
         return None
     
-    with st.spinner("Leyendo y procesando documentos..."):
+    with st.spinner("Indexando documentos..."):
         all_chunks = []
         for file in files:
-            # Crear archivo temporal para que PyPDFLoader pueda leerlo
-            with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
                 tmp.write(file.getvalue())
                 loader = PyPDFLoader(tmp.name)
                 docs = loader.load()
                 
-                # Dividir en trozos (Chunks)
                 splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
                 chunks = splitter.split_documents(docs)
                 all_chunks.extend(chunks)
-            os.unlink(tmp.name) # Borrar temporal
+            os.unlink(tmp.name) 
         
-        # Crear Embeddings (esto se descarga en la CPU de Streamlit)
         embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-        
-        # Crear base de datos vectorial en memoria
         vector_db = Chroma.from_documents(documents=all_chunks, embedding=embeddings)
         return vector_db
 
@@ -70,58 +63,54 @@ def crear_base_conocimiento(files):
 if uploaded_files:
     vector_db = crear_base_conocimiento(uploaded_files)
     
-    # Mostrar historial de mensajes
+    # Mostrar historial de mensajes acumulado
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
     # Entrada del usuario
     if prompt := st.chat_input("¿Qué dice el texto sobre...?"):
-        # Agregar mensaje del usuario al historial
-        st.session_state.messages.append({"role": "user", "content": prompt})
+        # 1. Mostrar y guardar mensaje del usuario
         with st.chat_message("user"):
             st.markdown(prompt)
+        st.session_state.messages.append({"role": "user", "content": prompt})
 
-        # Respuesta del asistente
+        # 2. Generar respuesta
         with st.chat_message("assistant"):
             if not groq_key:
-                st.error("Por favor, ingresa tu API Key en la barra lateral.")
+                st.error("Error: Falta la API Key de Groq.")
             else:
-                with st.spinner("Pensando..."):
-                    # 1. Buscar fragmentos relevantes
+                with st.spinner("Consultando contexto y memoria..."):
+                    # Búsqueda en vector DB
                     docs_relacionados = vector_db.similarity_search(prompt, k=4)
-                    contexto = "\n\n".join([f"[Pág {d.metadata.get('page', 'S/P')+1}] {d.page_content}" for d in docs_relacionados])
+                    contexto_pdf = "\n\n".join([f"[Pág {d.metadata.get('page', 0)+1}] {d.page_content}" for d in docs_relacionados])
                     
-                    # 2. Configurar el modelo (Llama 3.1)
-                    llm = ChatGroq(model_name="llama-3.1-8b-instant", groq_api_key=groq_key, temperature=0)
+                    # Construir historial para el LLM (últimos 4 mensajes para contexto)
+                    memoria_reciente = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in st.session_state.messages[-5:-1]])
                     
-                    # 3. Crear el prompt final
-                    # --- BUSCAR HISTORIAL PARA EL PROMPT ---
-                    # Tomamos los últimos 3 mensajes para no saturar al modelo
-                    contexto_historial = "\n".join([f"{m['role']}: {m['content']}" for m in st.session_state.messages[-3:]])
-
-                    # --- PROMPT FINAL ACTUALIZADO ---
+                    # Modelo e Invocación
+                    llm = ChatGroq(model_name="llama-3.1-8b-instant", groq_api_key=groq_key, temperature=0.1)
+                    
                     prompt_final = f"""
-                    Eres un profesor experto ayudando a un alumno con sus apuntes.
-                    A continuación tienes el historial reciente de la charla y el contexto del PDF.
-
-                    HISTORIAL RECIENTE:
-                    {contexto_historial}
-
+                    Eres un profesor experto. Responde basándote en el contexto del PDF y el historial de la charla.
+                    
+                    HISTORIAL DE CONVERSACIÓN:
+                    {memoria_reciente}
+                    
                     CONTEXTO DEL PDF:
-                    {contexto}
-
-                    PREGUNTA ACTUAL: {prompt}
-
-                    RESPUESTA (Basándote en el contexto y siguiendo el hilo de la charla):
+                    {contexto_pdf}
+                    
+                    PREGUNTA DEL ALUMNO: {prompt}
+                    
+                    INSTRUCCIÓN: Si la pregunta es ambigua, usa el HISTORIAL para saber de qué tema venimos hablando. 
+                    Si la respuesta no está en el CONTEXTO DEL PDF, admítelo.
                     """
                     
-                    # 4. Invocar y mostrar
                     response = llm.invoke(prompt_final)
                     respuesta_texto = response.content
                     st.markdown(respuesta_texto)
                     
-                    # Guardar en historial
+                    # Guardar respuesta en el historial
                     st.session_state.messages.append({"role": "assistant", "content": respuesta_texto})
 else:
-    st.info("👋 ¡Hola! Sube tus PDFs en la barra lateral para empezar a estudiar.")
+    st.info("👋 Sube tus archivos PDF para comenzar el chat.")
